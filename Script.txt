@@ -1,0 +1,146 @@
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import LineString
+import numpy as np
+
+
+
+# --- 1. Data Loading and Cleaning ---
+
+# Load FDD_stations.txt (Inventory data)
+# Assuming data is space-separated or variable-space separated
+try:
+    # Read the data, using the first row as headers and cleaning up extra spaces
+    fdd_df = pd.read_csv(r'c:\Users\manis\Downloads\AON\FDD_stations.txt', sep=r'\t', engine='python', encoding='utf-8')
+    # Clean the 'bankcd' column, ensuring it is treated as a string key
+    fdd_df['bankcd'] = fdd_df['bankcd'].astype(str)
+except FileNotFoundError:
+    print("Error: FDD_stations.txt not found.")
+    exit()
+
+# Load WAMIS_banckcd_coordinates.txt (Coordinate data)
+try:
+    # Note: The WAMIS bankcd column is formatted in scientific notation (e.g., 1.00001E+11).
+    # We must read it as a float first and then convert it back to a standard string/integer format
+    coord_df = pd.read_csv(r'c:\Users\manis\Downloads\AON\WAMIS_banckcd_coordinates.txt', sep=r'\t', engine='python', encoding='utf-8')
+    
+    # Process 'bankcd' from scientific notation to string (or integer)
+    # The source suggests these are 12-digit codes starting with 100... or 200...
+    coord_df['bankcd'] = coord_df['bankcd'].apply(lambda x: '{:.0f}'.format(x)).astype(str)
+
+    # Filter columns to only keep the necessary ID and coordinates
+    coord_df = coord_df[['bankcd', 'sttmx', 'sttmy', 'edtmx', 'edtmy']]
+
+    # Handle missing coordinate values (if any) by replacing with NaN
+    coord_cols = ['sttmx', 'sttmy', 'edtmx', 'edtmy']
+    for col in coord_cols:
+        # Convert non-numeric markers (like None, Null, or Korean '없음' or 0) to NaN
+        coord_df[col] = pd.to_numeric(coord_df[col], errors='coerce')
+    
+except FileNotFoundError:
+    print("Error: WAMIS_banckcd_coordinates.txt not found.")
+    exit()
+
+
+
+
+
+# --- 2. Data Merging ---
+
+# Merge the descriptive FDD data with the geographic coordinates (using a left join to keep all FDD records)
+merged_df = pd.merge( coord_df,fdd_df, on='bankcd', how='left')
+
+# --- 3. Geometry Creation (LineString) ---
+
+# Drop rows where start or end coordinates are missing (cannot create a line feature)
+merged_df.dropna(subset=['sttmx', 'sttmy', 'edtmx', 'edtmy'], inplace=True)
+
+# Create a 'geometry' column containing shapely LineString objects.
+# A LineString requires a sequence of coordinate pairs: [(start_x, start_y), (end_x, end_y)]
+def create_linestring(row):
+    try:
+        start_point = (row['sttmx'], row['sttmy'])
+        end_point = (row['edtmx'], row['edtmy'])
+        return LineString([start_point, end_point])
+    except:
+        return None # Return None if geometry creation fails
+
+merged_df['geometry'] = merged_df.apply(create_linestring, axis=1)
+
+# Drop any rows where LineString creation failed
+merged_df.dropna(subset=['geometry'], inplace=True)
+
+# --- 4. Create GeoDataFrame and Define CRS ---
+
+# Convert the Pandas DataFrame to a GeoDataFrame
+gdf = gpd.GeoDataFrame(merged_df, geometry='geometry')
+
+# Define the Coordinate Reference System (CRS)
+# The provided coordinates (sttmx, sttmy) appear to be in the UTM-K system (EPSG: 5179)
+# EPSG 5179 is the Korea 2000 / UTM-K (Unified CS)
+# This step is crucial for GIS compatibility.
+# If the coordinates were standard WGS84 Lat/Lon, EPSG 4326 would be used.
+gdf.crs = "EPSG:5179" 
+print(f"Assigned CRS: {gdf.crs}")
+
+
+# --- 5. Clean Attribute Names (Mandatory for Shapefile format) ---
+
+# Shapefile attribute column names often have limitations (e.g., max 10 characters, no special characters).
+# Rename the key columns to be compatible and concise:
+column_mapping = {
+    'bankcd': 'BANK_ID',
+    'banknm': 'Bank_Name',
+    'rivnm': 'River_Name',
+    'rivdv': 'Rvr_Class',
+    'staddr': 'Start_Addr',
+    'edaddr': 'End_Addr',
+    'stch': 'Start_CH',
+    'edch': 'End_CH',
+    'banklr': 'Bank_Side',
+    'len': 'Length_m',
+    'plfwv': 'P_Flow',      # Planned Flood Discharge
+    'plfwl': 'P_WL',        # Planned Flood Water Level
+    'plrivwith': 'P_Rvr_W', # Planned River Width
+    'bankwith': 'Crest_W',   # Bank Crest Width
+    'inslp': 'I_Slope',     # Inner Slope
+    'outslp': 'O_Slope',    # Outer Slope
+    'ebmttp': 'Material',
+    'sttmx': 'Start_X',
+    'sttmy': 'Start_Y',
+    'edtmx': 'End_X',
+    'edtmy': 'End_Y'
+}
+
+# Apply the renaming. Only columns present in the dataframe will be renamed.
+gdf.rename(columns=column_mapping, inplace=True)
+
+# Select and reorder final columns for the shapefile attributes
+final_columns = [
+    'BANK_ID', 'Bank_Name', 'River_Name', 'Rvr_Class', 'Bank_Side', 'Length_m',
+    'Start_CH', 'End_CH', 'Start_Addr', 'End_Addr',
+    'P_Flow', 'P_WL', 'P_Rvr_W', 'Crest_W', 'I_Slope', 'O_Slope', 'Material',
+    'Start_X', 'Start_Y', 'End_X', 'End_Y', 'geometry'
+]
+
+# Ensure we only try to select columns that exist in the GeoDataFrame
+existing_columns = [col for col in final_columns if col in gdf.columns]
+gdf = gdf[existing_columns]
+
+
+
+
+
+# --- 6. Export to Shapefile ---
+
+output_filepath = r'C:\Users\manis\Downloads\AON\South_Korea_Flood_Defenses.shp'
+try:
+    gdf.to_file(output_filepath, driver='ESRI Shapefile', encoding='utf-8')
+    print(f"\nSuccessfully created shapefile: {output_filepath}")
+    print(f"Total line features saved: {len(gdf)}")
+except Exception as e:
+    print(f"\nError saving shapefile: {e}")
+
+# Display a sample of the resulting data structure (showing the first 5 records and key columns)
+print("\nSample of the resulting GeoDataFrame:")
+print(gdf.head())
